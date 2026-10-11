@@ -271,13 +271,17 @@ def _guarded_query(storage, sql: str, params: list, budget: float = _RULE_SQL_BU
     读它),用完恢复原值——不能 set_progress_handler(None) 一清了之,
     那会把连接的兜底预算一起拆掉。
     """
-    prev = getattr(storage._local, "deadline", 0.0)
-    storage._local.deadline = time.monotonic() + budget
-    try:
-        with storage._conn() as conn:
+    if budget <= 0:
+        raise ValueError("query budget must be positive")
+    # _conn refreshes the connection's default deadline on entry. Apply the
+    # narrower rule deadline afterwards, and restore it before commit/rollback.
+    with storage._conn() as conn:
+        prev = storage._local.deadline
+        storage._local.deadline = min(prev, time.monotonic() + budget)
+        try:
             return conn.execute(sql, params).fetchall()
-    finally:
-        storage._local.deadline = prev
+        finally:
+            storage._local.deadline = prev
 
 
 def _exec_action(action: RuleAction, storage) -> list[dict]:
