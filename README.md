@@ -285,6 +285,25 @@ RSS:  35 MB (跑全部 9 源 + 端口 + 站点)
 | `mcp` | MCP stdio JSON-RPC 2.0 server |
 | `version` | 版本 |
 
+## 关联结果与当前风险
+
+关联规则可声明 `identity: auto|port|site|host|domain|workspace`（默认 `auto`）。
+端口身份包含协议、地址和端口（例如 `tcp://192.0.2.1:6379`），站点使用完整 URL。
+显式 `host` 按 IP（无 IP 则主机名）聚合；`workspace` 按工作空间聚合。
+聚合保存完整 `matched_assets`，不会只留下最后一个端口的证据。
+
+`correlations.status` 为 `active` 或 `resolved`，`risk` 只计算 active 命中。
+只有某规则完整执行成功才关闭该规则在当前工作空间的旧未命中结果；SQL 错误、
+规则解析失败、collect 超出 1000 行限制都会保留旧风险。`evaluated_run` 与
+`resolved_run` 记录评估 UUID，`correlation_history` 保存命中和关闭时的完整快照。
+历史可通过 `Storage.query("correlation_history")` 查询；当前结果可使用
+`arl-lite query correlations --filter "status='active'"`。
+Python 的普通 hit 列表仍可保存，但没有完整评估元数据的列表不会关闭旧结果。
+
+升级保留旧库尚存证据；升级前已经相互覆盖的端口证据无法恢复。
+这里的“当前”指最近成功规则评估的已存资产状态；规则不会主动重扫，也不会把
+缺少扫描结果解释为资产消失。多次评估应顺序执行、保存；历史尚无自动清理策略。
+
 ## 任务状态与退出码
 
 `run` 的任务状态(可 `arl-lite query tasks` 查看)与进程退出码口径对齐:

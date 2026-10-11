@@ -185,8 +185,7 @@ class Storage:
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='correlations'"
         ).fetchall()
         idx_names = {r["name"] for r in idx}
-        if any("correlations_uniq" in n for n in idx_names):
-            return  # 已经有 unique index
+        has_unique_index = any("correlations_uniq" in n for n in idx_names)
 
         # 1. 补缺列(从 v0.2 → v0.3)
         cur_cols = {row["name"] for row in conn.execute("PRAGMA table_info(correlations)").fetchall()}
@@ -198,14 +197,39 @@ class Storage:
             "advice": "ALTER TABLE correlations ADD COLUMN advice TEXT",
             "tags": "ALTER TABLE correlations ADD COLUMN tags TEXT",
             "rule_description": "ALTER TABLE correlations ADD COLUMN rule_description TEXT",
+            "matched_assets": "ALTER TABLE correlations ADD COLUMN matched_assets TEXT",
+            "matched_count": "ALTER TABLE correlations ADD COLUMN matched_count INTEGER DEFAULT 0",
+            "evidence": "ALTER TABLE correlations ADD COLUMN evidence TEXT",
         }
         for col, sql in needed.items():
             if col not in cur_cols:
-                try:
-                    conn.execute(sql)
-                    log.info(f"migrated: correlations ADD COLUMN {col}")
-                except Exception as e:
-                    log.warning(f"failed to add column {col}: {e}")
+                conn.execute(sql)
+                log.info(f"migrated: correlations ADD COLUMN {col}")
+
+        # Run even when the old UNIQUE index already exists. Keep surviving
+        # legacy evidence active until a complete reevaluation can resolve it.
+        lifecycle_columns = {
+            "status": "ALTER TABLE correlations ADD COLUMN status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved'))",
+            "evaluated_run": "ALTER TABLE correlations ADD COLUMN evaluated_run TEXT",
+            "resolved_run": "ALTER TABLE correlations ADD COLUMN resolved_run TEXT",
+            "resolved_at": "ALTER TABLE correlations ADD COLUMN resolved_at TIMESTAMP",
+        }
+        needs_archive = "status" not in cur_cols
+        for column, sql in lifecycle_columns.items():
+            if column not in cur_cols:
+                conn.execute(sql)
+        if needs_archive:
+            for row in conn.execute("SELECT * FROM correlations").fetchall():
+                conn.execute(
+                    """INSERT OR IGNORE INTO correlation_history
+                       (workspace_id, rule_name, target, evaluated_run, status, snapshot, recorded_at)
+                       VALUES (?, ?, ?, ?, 'active', ?, ?)""",
+                    (row["workspace_id"], row["rule_name"], row["target"],
+                     f"legacy-{row['id']}", json.dumps(dict(row), ensure_ascii=False),
+                     datetime.utcnow().isoformat()),
+                )
+        conn.execute("""CREATE INDEX IF NOT EXISTS idx_correlations_ws_status
+                        ON correlations(workspace_id, status, rule_name)""")
 
         # 1b. sites 表补 server 列(关联分析 istio_no_auth 规则需要)
         site_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sites)").fetchall()}
@@ -216,7 +240,10 @@ class Storage:
             except Exception as e:
                 log.warning(f"failed to add sites.server: {e}")
 
-        # 2. 删重复(保留 id 最大的)— 现在 target 列存在了
+        if has_unique_index:
+            return
+
+        # 2. Legacy duplicates are archived above before keeping the latest row.
         try:
             conn.execute("""
                 DELETE FROM correlations
@@ -1000,7 +1027,7 @@ class Storage:
             limit: 最大行数
         """
         ALLOWED = {"domains", "hosts", "ports", "sites", "findings",
-                   "tasks", "source_status", "correlations", "asset_changes",
+                   "tasks", "source_status", "correlations", "correlation_history", "asset_changes",
                    "workspaces", "monitors", "schedules"}
         if table not in ALLOWED:
             raise ValueError(f"table '{table}' not in whitelist: {sorted(ALLOWED)}")

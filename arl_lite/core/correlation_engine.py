@@ -22,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 log = logging.getLogger("arl_lite.core.correlation_engine")
 
@@ -53,6 +54,8 @@ class Rule:
     # 聚合型规则:collect 命中总数 >= count_min 时,整个 workspace 报一条
     # (而不是每个目标各报一条)。None = 普通逐目标规则
     count_min: int | None = None
+    identity: str = "auto"  # auto / port / site / host / domain / workspace
+    validation_errors: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -67,6 +70,19 @@ class CorrelationHit:
     description: str = ""  # 规则描述(save_correlations 用,免去重复加载规则)
     matched_count: int = 1  # 该 hit 覆盖的资产数(聚合规则 = 全部命中数)
     evidence_preview: str | None = None  # 聚合规则的证据摘要 JSON(可选)
+    identity: str = "auto"
+
+
+class CorrelationEvaluation(list):
+    """List-compatible hits with the provenance needed to resolve old results."""
+
+    def __init__(self, storage):
+        super().__init__()
+        self.evaluated_run = uuid4().hex
+        self.workspace_id = storage.workspace_id
+        self.db_path = str(storage.db_path.resolve())
+        self.successful_rules: set[str] = set()
+        self.failed_rules: dict[str, str] = {}
 
 
 # =========================
@@ -75,7 +91,7 @@ class CorrelationHit:
 
 # 缩进深度
 LIST_KEYS = {"collect", "cross_ref", "exclusion", "tags"}
-SCALAR_KEYS = {"name", "description", "risk", "headline", "advice", "count_min"}
+SCALAR_KEYS = {"name", "description", "risk", "headline", "advice", "count_min", "identity"}
 
 
 def _unquote(s: str) -> str:
@@ -124,6 +140,13 @@ def _parse_yaml(text: str) -> Rule:
                 rule.headline = v.strip()
             elif pending_key == "advice":
                 rule.advice = v
+            elif pending_key == "identity":
+                rule.identity = v.strip()
+            elif pending_key == "count_min":
+                try:
+                    rule.count_min = int(v.strip())
+                except ValueError:
+                    rule.validation_errors.append("invalid count_min")
             pending_key = None
             pending_value = []
 
@@ -135,6 +158,7 @@ def _parse_yaml(text: str) -> Rule:
             else:
                 # 缺 table/where 的项直接丢会静默损规则,必须留痕
                 log.warning(f"rule '{rule.name}' list item missing table/where, skipped: {current_action}")
+                rule.validation_errors.append("action missing table/where")
             current_action = None
 
     i = 0
@@ -174,6 +198,7 @@ def _parse_yaml(text: str) -> Rule:
                             rule.count_min = int(unquoted)
                         except (ValueError, TypeError):
                             log.warning(f"rule count_min value {unquoted!r} not int, ignored")
+                            rule.validation_errors.append("invalid count_min")
                     else:
                         setattr(rule, key, unquoted)
                 else:
@@ -187,6 +212,8 @@ def _parse_yaml(text: str) -> Rule:
                         rule.tags.extend(_parse_flow_list(value))
                     else:
                         log.warning(f"flow-style list not supported for '{key}', ignored")
+                        if value != "[]":
+                            rule.validation_errors.append(f"unsupported {key} list")
                 else:
                     current_list = getattr(rule, key)
                     current_list_key = key
@@ -213,6 +240,8 @@ def _parse_yaml(text: str) -> Rule:
             # 列表项的子字段
             k, _, v = stripped.partition(":")
             current_action[k.strip()] = _unquote(v.strip())
+        else:
+            rule.validation_errors.append(f"unrecognized rule line: {stripped}")
         i += 1
     flush_scalar()
     flush_action()
@@ -232,6 +261,7 @@ def load_rule(path: Path) -> Rule:
         raise ValueError(f"rule {path.name}: missing 'name'")
     if not rule.collect:
         raise ValueError(f"rule {path.name}: missing/empty 'collect' (bad indent? tabs? '-table:' without space?)")
+    _validate_rule(rule)
     return rule
 
 
@@ -283,8 +313,7 @@ def _guarded_query(storage, sql: str, params: list, budget: float = _RULE_SQL_BU
 def _exec_action(action: RuleAction, storage) -> list[dict]:
     """执行一条 SQL 片段(只读,带白名单 + 执行预算)"""
     if action.table not in ALLOWED_TABLES:
-        log.warning(f"rule action table '{action.table}' not in whitelist")
-        return []
+        raise ValueError(f"rule action table '{action.table}' not in whitelist")
     ws = storage.workspace_id
     sql = f"SELECT * FROM {action.table} WHERE workspace_id = ?"
     params: list = [ws]
@@ -293,16 +322,17 @@ def _exec_action(action: RuleAction, storage) -> list[dict]:
             from ..db.storage import check_filter_sql
             check_filter_sql(action.where)
         except ValueError as e:
-            log.warning(f"rule {action.table} where clause rejected: {e}")
-            return []
+            raise ValueError(f"rule {action.table} where clause rejected: {e}") from e
         sql += f" AND ({action.where})"
-    sql += " ORDER BY id DESC LIMIT 1000"
+    # One extra row detects truncation. A partial result cannot resolve old risk.
+    sql += " ORDER BY id DESC LIMIT 1001"
     try:
         rows = _guarded_query(storage, sql, params)
+        if len(rows) > 1000:
+            raise ValueError("collect exceeds 1000-row evaluation limit")
         return [dict(r) for r in rows]
     except Exception as e:
-        log.warning(f"rule action exec failed ({action.table}): {e}")
-        return []
+        raise RuntimeError(f"rule action exec failed ({action.table}): {e}") from e
 
 
 def _cross_ref_match(action: RuleAction, target: dict, storage) -> bool:
@@ -311,7 +341,7 @@ def _cross_ref_match(action: RuleAction, target: dict, storage) -> bool:
     SQL 中的 ports.ip / sites.ip 等会自动替换成 target 的实际值
     """
     if action.table not in ALLOWED_TABLES:
-        return False
+        raise ValueError(f"rule action table '{action.table}' not in whitelist")
     ws = storage.workspace_id
     sql = f"SELECT 1 FROM {action.table} WHERE workspace_id = ?"
     params: list = [ws]
@@ -330,21 +360,19 @@ def _cross_ref_match(action: RuleAction, target: dict, storage) -> bool:
                     where,
                 )
         except Exception as e:
-            log.warning(f"cross_ref placeholder substitution failed: {e}")
-            return False
+            raise ValueError(f"cross_ref placeholder substitution failed: {e}") from e
         try:
             from ..db.storage import check_filter_sql
             check_filter_sql(where)
-        except ValueError:
-            return False
+        except ValueError as e:
+            raise ValueError(f"cross_ref where clause rejected: {e}") from e
         sql += f" AND ({where})"
     sql += " LIMIT 1"
     try:
         rows = _guarded_query(storage, sql, params)
         return len(rows) > 0
     except Exception as e:
-        log.debug(f"cross_ref failed: {e}")
-        return False
+        raise RuntimeError(f"cross_ref failed: {e}") from e
 
 
 def _exclusion_match(action: RuleAction, target: dict, storage) -> bool:
@@ -352,7 +380,34 @@ def _exclusion_match(action: RuleAction, target: dict, storage) -> bool:
     return _cross_ref_match(action, target, storage)
 
 
-def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
+def _validate_rule(rule: Rule) -> None:
+    if rule.validation_errors:
+        raise ValueError("; ".join(rule.validation_errors))
+    if not rule.name or not rule.collect:
+        raise ValueError("rule requires name and collect")
+    if rule.identity not in {"auto", "port", "site", "host", "domain", "workspace"}:
+        raise ValueError(f"unsupported identity: {rule.identity}")
+    if rule.count_min is not None and rule.count_min <= 0:
+        raise ValueError("count_min must be positive")
+
+
+def run_rule(rule: Rule, storage) -> CorrelationEvaluation:
+    """Evaluate one rule; failures retain old risk rather than resembling no hits."""
+    result = CorrelationEvaluation(storage)
+    try:
+        _validate_rule(rule)
+        hits = _run_rule(rule, storage)
+        for hit in hits:
+            _target_identity(hit)
+        result.extend(hits)
+        result.successful_rules.add(rule.name)
+    except Exception as e:
+        result.failed_rules[rule.name] = str(e)
+        log.warning(f"rule '{rule.name}' evaluation failed: {e}")
+    return result
+
+
+def _run_rule(rule: Rule, storage) -> list[CorrelationHit]:
     """跑单条规则,返回命中列表"""
     if not rule.name:
         return []
@@ -360,18 +415,42 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
 
     # 1. 收集所有 collect 命中
     collect_targets: list[dict] = []
+    seen_hashes: set[tuple[str, str]] = set()
     for action in rule.collect:
-        collect_targets.extend(_exec_action(action, storage))
+        for target in _exec_action(action, storage):
+            # Hashes identify assets within their table, not across asset types.
+            asset_key = (action.table, target.get("hash") or str(sorted(target.items())))
+            if asset_key not in seen_hashes:
+                seen_hashes.add(asset_key)
+                collect_targets.append(target)
 
-    # 去重(按 hash)
-    seen_hashes: set[str] = set()
-    unique_targets: list[dict] = []
-    for t in collect_targets:
-        h = t.get("hash") or str(sorted(t.items()))
-        if h not in seen_hashes:
-            seen_hashes.add(h)
-            unique_targets.append(t)
-    collect_targets = unique_targets
+    # Validate all action definitions, including when collect returned no rows.
+    from ..db.storage import check_filter_sql
+    for action in rule.cross_ref + rule.exclusion:
+        if action.table not in ALLOWED_TABLES:
+            raise ValueError(f"rule action table '{action.table}' not in whitelist")
+        check_filter_sql(action.where)
+
+    if not collect_targets and (rule.cross_ref or rule.exclusion):
+        # Even a zero-hit collect needs valid cross-reference SQL before the
+        # rule can authoritatively close previous hits. Substitute the collect
+        # column names with neutral values to validate target placeholders.
+        probe_target = {}
+        with storage._conn() as conn:
+            for action in rule.collect:
+                for column in conn.execute(f"PRAGMA table_info({action.table})"):
+                    probe_target[column["name"]] = ""
+        for action in rule.cross_ref + rule.exclusion:
+            _cross_ref_match(action, probe_target, storage)
+
+    # Apply the same filters to count-based and per-asset rules.
+    filtered_targets = []
+    for target in collect_targets:
+        cross_matches = [_cross_ref_match(act, target, storage) for act in rule.cross_ref]
+        exclusion_matches = [_exclusion_match(act, target, storage) for act in rule.exclusion]
+        if all(cross_matches) and not any(exclusion_matches):
+            filtered_targets.append(target)
+    collect_targets = filtered_targets
 
     if not collect_targets:
         return []
@@ -382,7 +461,6 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
     if rule.count_min is not None:
         if len(collect_targets) < rule.count_min:
             return []
-        sample = collect_targets[:50]
         target = {"aggregate": "workspace", "count": len(collect_targets)}
         try:
             headline = rule.headline.format(count=len(collect_targets))
@@ -397,30 +475,13 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
             tags=list(rule.tags),
             description=rule.description,
             matched_count=len(collect_targets),
-            evidence_preview=json.dumps(
-                [{k: t.get(k) for k in ("id", "domain", "host", "ip", "url") if k in t}
-                 for t in sample],
-                ensure_ascii=False),
+            evidence_preview=json.dumps(collect_targets, ensure_ascii=False, default=str),
+            identity="workspace",
         ))
         return hits
 
-    # 2. 对每个 target,检查 cross_ref 和 exclusion
+    # Render the filtered per-target results.
     for target in collect_targets:
-        # cross_ref 必须全部命中
-        all_cross_ok = all(
-            _cross_ref_match(act, target, storage)
-            for act in rule.cross_ref
-        )
-        if rule.cross_ref and not all_cross_ok:
-            continue
-        # exclusion 不能有命中
-        any_excl = any(
-            _exclusion_match(act, target, storage)
-            for act in rule.exclusion
-        )
-        if any_excl:
-            continue
-
         # 格式化 headline
         try:
             headline = rule.headline.format(**{k: v for k, v in target.items() if isinstance(v, (str, int, float))})
@@ -437,13 +498,14 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
             advice=rule.advice,
             tags=list(rule.tags),
             description=rule.description,
+            identity=rule.identity,
         ))
 
     return hits
 
 
 def run_all_rules(storage, rules_dir: str | Path | None = None,
-                  rules_override: list[Rule] | None = None) -> list[CorrelationHit]:
+                  rules_override: list[Rule] | None = None) -> CorrelationEvaluation:
     """跑所有规则,返回所有命中
 
     Args:
@@ -459,70 +521,164 @@ def run_all_rules(storage, rules_dir: str | Path | None = None,
         rules = load_all_rules(rules_dir)
     log.info(f"running {len(rules)} correlation rules")
 
-    all_hits: list[CorrelationHit] = []
+    all_hits = CorrelationEvaluation(storage)
     for rule in rules:
         try:
             hits = run_rule(rule, storage)
             log.info(f"  rule '{rule.name}': {len(hits)} hit(s)")
             all_hits.extend(hits)
+            all_hits.successful_rules.update(hits.successful_rules)
+            all_hits.failed_rules.update(hits.failed_rules)
         except Exception as e:
             log.error(f"rule '{rule.name}' crashed: {e}")
+            all_hits.failed_rules[rule.name] = str(e)
 
     log.info(f"total correlations: {len(all_hits)}")
     return all_hits
 
 
-def save_correlations(storage, hits: list[CorrelationHit]) -> int:
-    """把命中写进 correlations 表,返回写入条数
-
-    description 随 hit 携带(旧版每条 hit 重新加载全部 37 个规则文件,
-    命中多时纯 IO 比规则执行还慢);失败升为 warning 不静默。
-    """
-    if not hits:
-        return 0
-    count = 0
-    for hit in hits:
-        # target 字段取主键(ip / host / domain),聚合规则固定为 workspace
-        if "aggregate" in hit.target:
-            target, target_type = f"workspace@{hit.target.get('aggregate')}", "aggregate"
+def _target_identity(hit: CorrelationHit) -> tuple[str, str]:
+    target = hit.target
+    identity = hit.identity
+    if identity == "workspace" or "aggregate" in target:
+        return "workspace@workspace", "aggregate"
+    if identity == "auto":
+        if target.get("url"):
+            identity = "site"
+        elif target.get("port") is not None and target.get("ip"):
+            identity = "port"
+        elif target.get("target"):
+            return str(target["target"]), target.get("target_type") or "other"
+        elif target.get("host"):
+            return str(target["host"]), "host"
+        elif target.get("domain"):
+            return str(target["domain"]), "domain"
+        elif target.get("ip"):
+            return str(target["ip"]), "ip"
         else:
-            target = (hit.target.get("ip")
-                      or hit.target.get("host")
-                      or hit.target.get("domain")
-                      or hit.target.get("target")
-                      or hit.target.get("url")
-                      or hit.target.get("id")
-                      or "unknown")
-            target_type = "ip" if "ip" in hit.target else (
-                "host" if "host" in hit.target else (
-                "domain" if "domain" in hit.target else (
-                "site" if "url" in hit.target else "other"
-            )))
-        evidence = hit.evidence_preview or json.dumps(hit.target, ensure_ascii=False, default=str)
-        try:
-            with storage._conn() as conn:
-                cur = conn.execute(
-                    """INSERT INTO correlations
-                       (workspace_id, rule_name, rule_description, risk,
-                        target, target_type, headline, advice, tags,
-                        matched_count, evidence, detected_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(workspace_id, rule_name, target) DO UPDATE SET
-                         rule_description = excluded.rule_description,
-                         risk = excluded.risk,
-                         headline = excluded.headline,
-                         advice = excluded.advice,
-                         tags = excluded.tags,
-                         matched_count = excluded.matched_count,
-                         evidence = excluded.evidence,
-                         detected_at = excluded.detected_at""",
-                    (storage.workspace_id, hit.rule_name, hit.description, hit.risk,
-                     str(target), target_type, hit.headline, hit.advice,
-                     json.dumps(hit.tags, ensure_ascii=False),
-                     hit.matched_count, evidence, datetime.utcnow().isoformat())
+            raise ValueError("correlation target has no stable asset identity")
+    if identity == "port":
+        address = target.get("ip") or target.get("host")
+        if not address or target.get("port") is None:
+            raise ValueError("port identity requires ip/host and port")
+        address = f"[{address}]" if ":" in str(address) else str(address)
+        protocol = str(target.get("protocol") or "tcp").lower()
+        return f"{protocol}://{address}:{int(target['port'])}", "port"
+    if identity == "site":
+        value = target.get("url") or target.get("target")
+    elif identity == "host":
+        value = target.get("ip") or target.get("host") or target.get("domain")
+    elif identity == "domain":
+        value = target.get("domain") or target.get("host")
+    else:
+        raise ValueError(f"unsupported identity: {identity}")
+    if not value:
+        raise ValueError(f"{identity} identity requires its asset identifier")
+    return str(value), identity
+
+
+def _archive_correlation(conn, row: dict, evaluated_run: str) -> None:
+    conn.execute(
+        """INSERT OR IGNORE INTO correlation_history
+           (workspace_id, rule_name, target, evaluated_run, status, snapshot, recorded_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (row["workspace_id"], row["rule_name"], row["target"], evaluated_run,
+         row["status"], json.dumps(row, ensure_ascii=False, default=str),
+         datetime.utcnow().isoformat()),
+    )
+
+
+def save_correlations(storage, hits: list[CorrelationHit]) -> int:
+    """Save a complete evaluation atomically, preserving evidence history.
+
+    Ordinary lists remain supported, but cannot resolve old hits because they
+    lack successful evaluation metadata. An empty successful evaluation can.
+    Errors roll back the entire save and propagate to the caller.
+    """
+    if isinstance(hits, CorrelationEvaluation):
+        if (hits.workspace_id != storage.workspace_id
+                or hits.db_path != str(storage.db_path.resolve())):
+            raise ValueError("correlation evaluation belongs to another workspace")
+        evaluated_run = hits.evaluated_run
+        successful = hits.successful_rules - hits.failed_rules.keys()
+        failed = hits.failed_rules
+    else:
+        evaluated_run, successful, failed = uuid4().hex, set(), {}
+
+    groups: dict[tuple[str, str], list[CorrelationHit]] = {}
+    for hit in hits:
+        if hit.rule_name in failed:
+            continue
+        target, _ = _target_identity(hit)
+        groups.setdefault((hit.rule_name, target), []).append(hit)
+
+    count = 0
+    now = datetime.utcnow().isoformat()
+    with storage._conn() as conn:
+        for (rule_name, target), matches in groups.items():
+            hit = matches[0]
+            _, target_type = _target_identity(hit)
+            assets = []
+            for match in matches:
+                if match.evidence_preview:
+                    evidence = json.loads(match.evidence_preview)
+                    assets.extend(evidence if isinstance(evidence, list) else [evidence])
+                else:
+                    assets.append(match.target)
+            evidence = json.dumps(assets, ensure_ascii=False, default=str)
+            # Preserve the old version even for legacy rows before updating.
+            previous = conn.execute(
+                "SELECT * FROM correlations WHERE workspace_id=? AND rule_name=? AND target=?",
+                (storage.workspace_id, rule_name, target),
+            ).fetchone()
+            if previous:
+                _archive_correlation(conn, dict(previous),
+                                     previous["evaluated_run"] or f"legacy-{previous['id']}")
+            cur = conn.execute(
+                """INSERT INTO correlations
+                   (workspace_id, rule_name, rule_description, risk, target,
+                    target_type, headline, advice, tags, matched_assets,
+                    matched_count, evidence, detected_at, status, evaluated_run)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                   ON CONFLICT(workspace_id, rule_name, target) DO UPDATE SET
+                     rule_description=excluded.rule_description, risk=excluded.risk,
+                     target_type=excluded.target_type, headline=excluded.headline,
+                     advice=excluded.advice, tags=excluded.tags,
+                     matched_assets=excluded.matched_assets,
+                     matched_count=excluded.matched_count, evidence=excluded.evidence,
+                     detected_at=excluded.detected_at, status='active',
+                     evaluated_run=excluded.evaluated_run, resolved_run=NULL,
+                     resolved_at=NULL""",
+                (storage.workspace_id, rule_name, hit.description,
+                 max(match.risk for match in matches), target, target_type,
+                 hit.headline, hit.advice, json.dumps(hit.tags, ensure_ascii=False),
+                 evidence, sum(match.matched_count for match in matches), evidence,
+                 now, evaluated_run),
+            )
+            count += cur.rowcount
+            row = conn.execute(
+                "SELECT * FROM correlations WHERE workspace_id=? AND rule_name=? AND target=?",
+                (storage.workspace_id, rule_name, target),
+            ).fetchone()
+            _archive_correlation(conn, dict(row), evaluated_run)
+
+        for rule_name in successful:
+            # The new active rows carry this evaluation ID. All older active
+            # rows for this workspace/rule are absent from its complete result.
+            old_rows = conn.execute(
+                """SELECT * FROM correlations WHERE workspace_id=? AND rule_name=?
+                   AND status='active' AND (evaluated_run IS NULL OR evaluated_run<>?)""",
+                (storage.workspace_id, rule_name, evaluated_run),
+            ).fetchall()
+            for row in old_rows:
+                _archive_correlation(conn, dict(row),
+                                     row["evaluated_run"] or f"legacy-{row['id']}")
+                conn.execute(
+                    """UPDATE correlations SET status='resolved', resolved_run=?, resolved_at=?
+                       WHERE id=? AND workspace_id=?""",
+                    (evaluated_run, now, row["id"], storage.workspace_id),
                 )
-                # 新行和被刷新的行 rowcount 都是 1,只有内容完全没变的行才是 0
-                count += cur.rowcount
-        except Exception as e:
-            log.warning(f"save correlation failed ({hit.rule_name}@{target}): {e}")
+                resolved = dict(row)
+                resolved.update(status="resolved", resolved_run=evaluated_run, resolved_at=now)
+                _archive_correlation(conn, resolved, evaluated_run)
     return count

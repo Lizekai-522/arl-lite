@@ -43,7 +43,7 @@ def _score_to_level(score: int) -> str:
 
 def compute_asset_risks(storage) -> list[AssetRisk]:
     """从 correlations 表计算每个 asset 的风险评分"""
-    rows = storage.query("correlations", limit=10000)
+    rows = storage.query("correlations", filter_sql="status = 'active'", limit=10000)
     if not rows:
         return []
 
@@ -95,7 +95,7 @@ def compute_asset_risks(storage) -> list[AssetRisk]:
 
 def risk_summary(storage) -> dict:
     """workspace 整体风险概览"""
-    rows = storage.query("correlations", limit=10000)
+    rows = storage.query("correlations", filter_sql="status = 'active'", limit=10000)
     by_level = {"low": 0, "medium": 0, "high": 0, "critical": 0}
     for r in rows:
         score = r.get("risk", 0) or 0

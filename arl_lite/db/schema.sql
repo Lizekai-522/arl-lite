@@ -328,12 +328,32 @@ CREATE TABLE IF NOT EXISTS correlations (
     matched_count INTEGER DEFAULT 0,
     evidence TEXT,                     -- JSON,执行引擎的中间结果
     detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'resolved')),
+    evaluated_run TEXT,                -- UUID of latest successful matching evaluation
+    resolved_run TEXT,                 -- successful evaluation that closed this hit
+    resolved_at TIMESTAMP,
     UNIQUE(workspace_id, rule_name, target),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_correlations_ws_rule ON correlations(workspace_id, rule_name);
 CREATE INDEX IF NOT EXISTS idx_correlations_ws_risk ON correlations(workspace_id, risk DESC);
+
+-- Append-only evidence snapshots; the correlations table is the latest state.
+CREATE TABLE IF NOT EXISTS correlation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    rule_name TEXT NOT NULL,
+    target TEXT,
+    evaluated_run TEXT NOT NULL,
+    status TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    recorded_at TIMESTAMP NOT NULL,
+    UNIQUE(workspace_id, rule_name, target, evaluated_run, status),
+    FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_correlation_history_ws_rule
+ON correlation_history(workspace_id, rule_name);
 
 -- ----------------------------------------------------------------------------
 -- 13. fingerprints —— 指纹规则缓存(避免每次重新解析 webapp.json)
