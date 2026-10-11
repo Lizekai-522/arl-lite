@@ -34,10 +34,14 @@ class HttpxProbeModule(BaseModule):
         schemes = kwargs.get("schemes") or ["http", "https"]
 
         results = []
+        errors = []
         async for site in probe(
             target, ports=ports, schemes=schemes,
-            timeout=timeout, concurrency=concurrency,
+            timeout=timeout, concurrency=concurrency, include_errors=True,
         ):
+            if site.get("error"):
+                errors.append(f"{site['url']}: {site['error']}")
+                continue
             results.append(site)
             self.storage.add_site(
                 task_id=self.task_id,
@@ -57,11 +61,13 @@ class HttpxProbeModule(BaseModule):
 
         sr = self.make_source_result(
             data=results, source=self.name, start_time=start,
+            error="; ".join(errors[:5]) if errors else None,
+            error_type="network" if errors else None,
         )
 
         return ModuleResult(
             success=sr.ok, target=target, found=len(results),
             duration_seconds=time.time() - start,
-            sources=[sr], errors=[],
+            sources=[sr], errors=errors,
             metadata={"scanned_ports": ports, "schemes": schemes}
         )

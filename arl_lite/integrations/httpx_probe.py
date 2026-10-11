@@ -202,6 +202,7 @@ async def probe(
     schemes: list[str] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
     concurrency: int = DEFAULT_CONCURRENCY,
+    include_errors: bool = False,
 ) -> AsyncIterator[dict]:
     """HTTP 探活
 
@@ -232,6 +233,8 @@ async def probe(
             r = await asyncio.wrap_future(fut)
             if r.get("error") and not r.get("status"):
                 # 网络错(无响应)
+                if include_errors:
+                    yield {"url": url, "error": r["error"], "status": 0}
                 continue
             # HTTP 错(4xx/5xx)也算"站点存活",保留
             body = r.get("body", "")

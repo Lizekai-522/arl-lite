@@ -97,8 +97,8 @@ def test_nuclei():
 
     # scan_with_templates 在非可达 target 上不应 crash
     result = scan_with_templates("https://nonexistent-host-12345.invalid/", BUILTIN_TEMPLATES[:3])
-    if isinstance(result, list):
-        ok(f"scan_with_templates: {len(result)} results (空 host 不 crash)")
+    if not result.ok and result.error and result.completed == 0:
+        ok(f"scan_with_templates: explicit failure: {result.error_type}")
     else:
         fail(f"scan_with_templates: {type(result)}")
 

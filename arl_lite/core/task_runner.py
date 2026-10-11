@@ -13,7 +13,7 @@ import asyncio
 import threading
 from datetime import datetime
 
-from .base_module import BaseModule, ModuleResult
+from .base_module import BaseModule, ModuleResult, SourceResult
 from ..db.storage import Storage
 from ..modules.registry import discover_modules
 
@@ -107,6 +107,7 @@ class TaskRunner:
                 log.error(err)
                 all_errors.append(err)
                 sources_failed += 1
+                self.storage.record_source_status(task_id, mod_name, False, error_type="module_missing", error_message=err)
                 continue
             mod_cls = available[mod_name]
             # 关键:注入 storage 实例,避免 Module 内部 new
@@ -137,6 +138,11 @@ class TaskRunner:
                     await mod.setup()
                     result = await mod.run(target)
                     await mod.teardown()
+                    if not result.sources:
+                        result.sources = [SourceResult(
+                            ok=result.success, source=mod.name,
+                            error=None if result.success else "; ".join(result.errors) or "module failed without source details",
+                            error_type=None if result.success else "module_failure")]
                     log.info(
                         f"[{mod.name}] done: found={result.found} "
                         f"duration={result.duration_seconds:.1f}s errors={len(result.errors)}"
@@ -147,6 +153,8 @@ class TaskRunner:
                     return ModuleResult(
                         success=False, target=target, found=0,
                         duration_seconds=0, errors=[f"{mod.name} crashed: {e}"],
+                        sources=[SourceResult(ok=False, source=mod.name,
+                                              error=f"{type(e).__name__}: {e}", error_type="module_crash")],
                     )
 
             # asyncio.gather 让所有 module 并发跑

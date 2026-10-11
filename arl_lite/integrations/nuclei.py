@@ -17,6 +17,21 @@ import json
 import logging
 import shlex
 import subprocess
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ScanResult:
+    """Completed-empty is distinct from a failed or incomplete measurement."""
+    data: list[dict] = field(default_factory=list)
+    error: str | None = None
+    error_type: str | None = None
+    attempted: int = 0
+    completed: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
 
 log = logging.getLogger("arl_lite.integrations.nuclei")
 
@@ -27,7 +42,7 @@ def run_nuclei(
     severity: str = "info,low,medium,high,critical",
     tags: str = "",
     templates: str = "",
-) -> list[dict]:
+) -> ScanResult:
     """调用 nuclei binary
 
     Args:
@@ -38,7 +53,7 @@ def run_nuclei(
         templates: 自定义模板目录
 
     Returns:
-        findings list(每条 dict)
+        ScanResult(data, error, error_type); empty data alone is not failure.
     """
     cmd = [
         "nuclei",
@@ -59,26 +74,38 @@ def run_nuclei(
             cmd, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired as e:
-        log.warning(f"nuclei timeout after {timeout}s")
-        return []
+        return ScanResult(error=f"nuclei timeout after {timeout}s", error_type="timeout", attempted=1)
     except FileNotFoundError:
-        log.warning("nuclei binary not found")
-        return []
-
-    if proc.returncode != 0 and not proc.stdout:
-        log.warning(f"nuclei exit={proc.returncode} stderr={proc.stderr[:200]}")
-        return []
+        return ScanResult(error="nuclei binary not found", error_type="dependency", attempted=1)
+    except OSError as e:
+        return ScanResult(error=str(e), error_type="execution", attempted=1)
 
     results = []
+    bad_lines = 0
     for line in proc.stdout.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            results.append(json.loads(line))
-        except json.JSONDecodeError:
-            log.debug(f"nuclei output not JSON: {line[:80]}")
-    return results
+            item = json.loads(line)
+            if not isinstance(item, dict):
+                raise ValueError("expected object")
+            matched = item.get("matched_at", item.get("matched-at"))
+            if not isinstance(matched, str) or not matched:
+                raise ValueError("missing matched target")
+            info = item.get("info") if isinstance(item.get("info"), dict) else {}
+            results.append({**item, "matched_at": matched,
+                            "name": item.get("name", info.get("name", item.get("template-id", "?"))),
+                            "severity": item.get("severity", info.get("severity", "info")),
+                            "description": item.get("description", info.get("description", "")),
+                            "classification": item.get("classification", info.get("classification", {}))})
+        except (json.JSONDecodeError, ValueError):
+            bad_lines += 1
+    if proc.returncode != 0:
+        return ScanResult(results, f"nuclei exit={proc.returncode}: {proc.stderr[:200]}", "execution", 1, 0)
+    if bad_lines:
+        return ScanResult(results, f"nuclei returned {bad_lines} invalid record(s)", "parse", 1, 0)
+    return ScanResult(results, attempted=1, completed=1)
 
 
 # =========================
@@ -287,7 +314,7 @@ BUILTIN_TEMPLATES = [
 ]
 
 
-def scan_with_templates(target: str, templates: list[dict]) -> list[dict]:
+def scan_with_templates(target: str, templates: list[dict]) -> ScanResult:
     """用内建模板跑探测(纯 HTTP)
 
     Args:
@@ -306,6 +333,8 @@ def scan_with_templates(target: str, templates: list[dict]) -> list[dict]:
 
     ctx = ssl.create_default_context()
     matches = []
+    errors = []
+    completed = 0
     for t in templates:
         url = target + t["path"].lstrip("/")
         try:
@@ -322,7 +351,10 @@ def scan_with_templates(target: str, templates: list[dict]) -> list[dict]:
             except Exception:
                 pass
         except Exception as e:
+            errors.append(f"{t['id']}: {type(e).__name__}: {e}")
             continue
+
+        completed += 1
 
         # 状态码匹配
         match_status = t.get("match_status", 200)
@@ -346,4 +378,5 @@ def scan_with_templates(target: str, templates: list[dict]) -> list[dict]:
             "matched_at": url,
             "matcher_name": "status+keywords",
         })
-    return matches
+    return ScanResult(matches, "; ".join(errors[:5]) if errors else None,
+                      "network" if errors else None, len(templates), completed)
