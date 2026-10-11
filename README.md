@@ -172,10 +172,12 @@ arl-lite notify test \
     --min-severity critical
 
 # Watch 持续监控
-arl-lite watch add example.com --interval 3600 --modules dns,whois
+# notify test 只测试、不保存；先明确保存 watch 使用的配置
+arl-lite notify set -w family-assets --provider ntfy --url https://ntfy.sh/your-secret-topic --min-severity critical
+arl-lite watch add example.com -w family-assets --interval 3600 --modules dns,whois
 arl-lite watch add foo.com --interval 7200
 arl-lite watch list
-arl-lite watch start
+arl-lite watch start -w family-assets
 # 前台运行,Ctrl+C 停止;变更写入 asset_changes,`arl-lite monitor changes` 可查
 ```
 

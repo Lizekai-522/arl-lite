@@ -708,22 +708,25 @@ def cmd_watch_add(args) -> int:
         print(f"[!] watch target too long: {len(args.target)} > 1000", file=sys.stderr)
         return 2
 
-    storage = Storage(workspace=args.workspace if hasattr(args, "workspace") else "default")
-    # 单进程内:复用全局 watcher 状态(简化)
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_file = state_dir / "watch.json"
+    storage, state_file = _watch_state(args)
+    if args.interval < 60:
+        print("[!] interval must be >= 60 seconds", file=sys.stderr)
+        return 2
 
     targets = []
     if state_file.exists():
         try:
             targets = json.loads(state_file.read_text())
-        except Exception:
-            targets = []
+        except Exception as e:
+            print(f"[!] invalid watch configuration: {e}", file=sys.stderr)
+            return 2
 
     modules = None
     if args.modules:
         modules = [m.strip() for m in args.modules.split(",") if m.strip()]
+        if not modules or any(m not in discover_modules() for m in modules):
+            print("[!] invalid watch modules", file=sys.stderr)
+            return 2
 
     entry = {
         "target": args.target,
@@ -732,7 +735,7 @@ def cmd_watch_add(args) -> int:
     }
     targets = [t for t in targets if t["target"] != args.target]
     targets.append(entry)
-    state_file.write_text(json.dumps(targets, indent=2, ensure_ascii=False))
+    _save_config(state_file, targets)
     print(f"[+] watch: added {args.target} (interval={args.interval}s)")
     print(f"    state: {state_file}")
     return 0
@@ -740,15 +743,14 @@ def cmd_watch_add(args) -> int:
 
 def cmd_watch_remove(args) -> int:
     """移除 watch target"""
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    _, state_file = _watch_state(args)
     if not state_file.exists():
         print("[!] no watch state")
         return 1
     targets = json.loads(state_file.read_text())
     before = len(targets)
     targets = [t for t in targets if t["target"] != args.target]
-    state_file.write_text(json.dumps(targets, indent=2, ensure_ascii=False))
+    _save_config(state_file, targets)
     if len(targets) < before:
         print(f"[+] removed {args.target}")
         return 0
@@ -758,8 +760,7 @@ def cmd_watch_remove(args) -> int:
 
 def cmd_watch_list(args) -> int:
     """列出 watch targets"""
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    _, state_file = _watch_state(args)
     if not state_file.exists():
         print("[i] no watch targets (use `arl-lite watch add` first)")
         return 0
@@ -779,8 +780,7 @@ def cmd_watch_start(args) -> int:
     """启动 watch 调度器(同步跑,Ctrl+C 退出)"""
     from .core.watcher import Watcher
 
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    storage, state_file = _watch_state(args)
     if not state_file.exists():
         print("[!] no watch state")
         return 1
@@ -789,8 +789,7 @@ def cmd_watch_start(args) -> int:
         print("[!] no watch targets")
         return 1
 
-    storage = Storage(workspace=getattr(args, "workspace", "default"))
-    w = Watcher(storage)
+    w = Watcher(storage, webhook_config=_load_webhook(storage))
     skipped = 0
     for t in targets_data:
         # 历史坏 entry(如空 target)跳过并告警,不中断整个 watch
@@ -835,6 +834,55 @@ def cmd_watch_start(args) -> int:
 def cmd_watch_stop(args) -> int:
     """watch stop(同 start 一样立刻返回,因为是同步)"""
     print("[i] watch 是同步模式,直接 Ctrl+C 退出 start 即可")
+    return 0
+
+
+def _save_config(path: Path, value) -> None:
+    """Replace a complete config file instead of exposing a partial write."""
+    import os
+    import tempfile
+    fd, name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _watch_state(args):
+    storage = Storage(workspace=getattr(args, "workspace", "default"))
+    path = storage.workspace_dir / "watch.json"
+    # The historical global list belongs only to default. Do not copy it
+    # into every named workspace, or overwrite the historical file.
+    legacy = Path.home() / ".arl-lite" / "watch" / "watch.json"
+    if storage.workspace == "default" and not path.exists() and legacy.exists():
+        _save_config(path, json.loads(legacy.read_text(encoding="utf-8")))
+    return storage, path
+
+
+def _load_webhook(storage):
+    from .notify import WebhookConfig
+    path = storage.workspace_dir / "notify.json"
+    if not path.exists():
+        return None
+    return WebhookConfig(**json.loads(path.read_text(encoding="utf-8")))
+
+
+def cmd_notify_set(args) -> int:
+    """Persist configuration for future watch starts; never send a message."""
+    from dataclasses import asdict
+    from .notify import WebhookConfig
+    try:
+        config = WebhookConfig(url=args.url or "", provider=args.provider,
+                               min_severity=args.min_severity, timeout=args.timeout)
+    except ValueError as exc:
+        print(f"[!] config error: {exc}", file=sys.stderr)
+        return 2
+    storage = Storage(workspace=args.workspace)
+    _save_config(storage.workspace_dir / "notify.json", asdict(config))
+    print(f"[+] notification configuration saved for {storage.workspace}")
     return 0
 
 
@@ -1099,21 +1147,32 @@ def build_parser() -> argparse.ArgumentParser:
     pnft.add_argument("--min-severity", default="info", choices=["info", "low", "medium", "high", "critical"])
     pnft.add_argument("--timeout", type=int, default=10)
     pnft.set_defaults(func=cmd_notify_test)
+    pnfs = pnf_sub.add_parser("set", help="保存当前 workspace 的 watch 通知配置（不发送）")
+    pnfs.add_argument("-w", "--workspace", default="default")
+    pnfs.add_argument("--url")
+    pnfs.add_argument("--provider", default="generic", choices=["generic", "ntfy", "slack", "local"])
+    pnfs.add_argument("--min-severity", default="high", choices=["info", "low", "medium", "high", "critical"])
+    pnfs.add_argument("--timeout", type=int, default=10)
+    pnfs.set_defaults(func=cmd_notify_set)
 
     # watch (v0.7)
     pwa = sub.add_parser("watch", help="持续监控 / Watch 模式")
     pwa_sub = pwa.add_subparsers(dest="watch_cmd", required=True)
     pwaa = pwa_sub.add_parser("add", help="添加 watch target")
     pwaa.add_argument("target", help="目标域名/IP")
+    pwaa.add_argument("-w", "--workspace", default="default")
     pwaa.add_argument("-m", "--modules", help="逗号分隔 module 列表")
     pwaa.add_argument("--interval", type=int, default=86400, help="重跑间隔秒(默认 86400=24h)")
     pwaa.set_defaults(func=cmd_watch_add)
     pwar = pwa_sub.add_parser("remove", help="移除 watch target")
     pwar.add_argument("target", help="目标")
+    pwar.add_argument("-w", "--workspace", default="default")
     pwar.set_defaults(func=cmd_watch_remove)
     pwal = pwa_sub.add_parser("list", help="列出 watch targets")
+    pwal.add_argument("-w", "--workspace", default="default")
     pwal.set_defaults(func=cmd_watch_list)
     pwas = pwa_sub.add_parser("start", help="启动 watch 调度器(前台运行,Ctrl+C 停止)")
+    pwas.add_argument("-w", "--workspace", default="default")
     pwas.set_defaults(func=cmd_watch_start)
     pwap = pwa_sub.add_parser("stop", help="停止 watch 调度器")
     pwap.set_defaults(func=cmd_watch_stop)
