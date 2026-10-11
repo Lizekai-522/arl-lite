@@ -233,7 +233,7 @@ def _parse_response(data: bytes) -> tuple[int, int, list[DNSRecord]]:
     return rcode, ancount, records
 
 
-def lookup(name: str, server: str | None = None, timeout: int = 5) -> dict:
+def lookup(name: str, server: str | None = None, timeout: int = 5, should_stop=lambda: False) -> dict:
     """查询一个域名的所有常见记录
 
     Args:
@@ -277,6 +277,8 @@ def lookup(name: str, server: str | None = None, timeout: int = 5) -> dict:
     ]
     errors = []
     for rtype, name_str in rtypes:
+        if should_stop():
+            raise InterruptedError("DNS lookup stopped")
         try:
             data, sent_txid = _query(server, name, rtype, timeout=timeout)
             # TXID 不匹配 = 抢答/伪造包,丢弃(同网段投毒防线)

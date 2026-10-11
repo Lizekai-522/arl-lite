@@ -12,6 +12,7 @@ GitHub 监控 — 探测代码泄漏 / 凭证 / 敏感文件。
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
 import time
 
@@ -43,9 +44,11 @@ class GithubModule(BaseModule):
         all_results = []
         errors: list[str] = []
         for q_template in queries:
+            if self.should_stop():
+                raise asyncio.CancelledError()
             try:
                 query = q_template.format(target=target_domain, domain=target_domain)
-                results = search_github(query, token=token, per_page=per_query, timeout=15)
+                results = await asyncio.to_thread(search_github, query, token=token, per_page=per_query, timeout=15)
             except Exception as e:
                 # 每条 query 独立容错,但失败要留痕(不再静默)
                 log.warning(f"github search failed for {q_template!r}: {e}")

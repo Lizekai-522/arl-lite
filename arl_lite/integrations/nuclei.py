@@ -27,6 +27,7 @@ def run_nuclei(
     severity: str = "info,low,medium,high,critical",
     tags: str = "",
     templates: str = "",
+    should_stop=lambda: False,
 ) -> list[dict]:
     """调用 nuclei binary
 
@@ -55,9 +56,8 @@ def run_nuclei(
 
     log.debug(f"running nuclei: {' '.join(shlex.quote(c) for c in cmd)}")
     try:
-        proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
-        )
+        from ..core.process import run_process_sync
+        proc = run_process_sync(cmd, timeout, should_stop)
     except subprocess.TimeoutExpired as e:
         log.warning(f"nuclei timeout after {timeout}s")
         return []
@@ -287,7 +287,7 @@ BUILTIN_TEMPLATES = [
 ]
 
 
-def scan_with_templates(target: str, templates: list[dict]) -> list[dict]:
+def scan_with_templates(target: str, templates: list[dict], should_stop=lambda: False) -> list[dict]:
     """用内建模板跑探测(纯 HTTP)
 
     Args:
@@ -307,6 +307,8 @@ def scan_with_templates(target: str, templates: list[dict]) -> list[dict]:
     ctx = ssl.create_default_context()
     matches = []
     for t in templates:
+        if should_stop():
+            raise InterruptedError("template scan stopped")
         url = target + t["path"].lstrip("/")
         try:
             req = urllib.request.Request(url, method="GET",

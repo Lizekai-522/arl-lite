@@ -210,7 +210,12 @@ def cmd_run(args) -> int:
             preset=args.preset,
         )
 
-    result = asyncio.run(_go())
+    try:
+        result = asyncio.run(_go())
+    except asyncio.CancelledError:
+        return 130
+    if shutdown.shutdown_requested:
+        return 130
 
     print()
     print(f"[+] done in {result.duration_seconds:.1f}s")

@@ -10,6 +10,7 @@ DNS 详细记录枚举 module。
 from __future__ import annotations
 
 import logging
+import asyncio
 import time
 
 from ....core.base_module import BaseModule, ModuleResult
@@ -36,7 +37,7 @@ class DNSModule(BaseModule):
         timeout = int(kwargs.get("timeout", 5))
 
         try:
-            result = lookup(target_domain, server=dns_server, timeout=timeout)
+            result = await asyncio.to_thread(lookup, target_domain, server=dns_server, timeout=timeout, should_stop=self.should_stop)
         except Exception as e:
             log.exception(f"dns lookup failed: {e}")
             return ModuleResult(

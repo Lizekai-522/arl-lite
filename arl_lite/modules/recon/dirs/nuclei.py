@@ -11,6 +11,7 @@ Nuclei 集成 — 调外部 nuclei binary(如果装了),否则 fallback 到模�
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import shutil
 import time
@@ -48,9 +49,9 @@ class NucleiModule(BaseModule):
                 # 引发对目标的二次扫描(旧版把入库循环也包进 try,
                 # matched_at:null 就切换到内建模板重扫,产出混杂结果)
                 results = [
-                    r for r in run_nuclei(
+                    r for r in await asyncio.to_thread(run_nuclei,
                         target, timeout=timeout, severity=severity,
-                        tags=tags, templates=templates,
+                        tags=tags, templates=templates, should_stop=self.should_stop,
                     )
                     if isinstance(r, dict) and isinstance(r.get("matched_at"), str)
                 ]
@@ -81,7 +82,7 @@ class NucleiModule(BaseModule):
 
         # 2. fallback:内建模板
         log.info(f"using built-in templates fallback for {target}")
-        results = scan_with_templates(target, BUILTIN_TEMPLATES)
+        results = await asyncio.to_thread(scan_with_templates, target, BUILTIN_TEMPLATES, self.should_stop)
         for r in results:
             self.storage.add_finding(
                 task_id=self.task_id,

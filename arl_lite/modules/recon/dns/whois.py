@@ -5,6 +5,7 @@ WHOIS module — 查域名注册信息。
 from __future__ import annotations
 
 import json
+import asyncio
 import logging
 import time
 
@@ -30,7 +31,7 @@ class WhoisModule(BaseModule):
         timeout = int(kwargs.get("timeout", 10))
 
         try:
-            result = whois_query(target_domain, timeout=timeout)
+            result = await asyncio.to_thread(whois_query, target_domain, timeout=timeout, should_stop=self.should_stop)
         except Exception as e:
             log.exception(f"whois failed: {e}")
             return ModuleResult(

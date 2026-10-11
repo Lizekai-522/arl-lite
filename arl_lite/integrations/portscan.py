@@ -105,16 +105,21 @@ async def scan_tcp(
     """
     loop = asyncio.get_running_loop()
     # 用 ThreadPoolExecutor 跑阻塞 socket(因为 socket.connect_ex 是阻塞)
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    try:
         futures = {
             pool.submit(_probe_tcp, host, port, timeout): port
             for port in ports
         }
-        for fut in as_completed(futures):
+        for fut in asyncio.as_completed([asyncio.wrap_future(f) for f in futures]):
             # wrap_future:等待期间让事件循环调度其他协程(旧写法冻结 loop)
-            r = await asyncio.wrap_future(fut)
+            r = await fut
             if r is not None:
                 yield r
+    finally:
+        # Running sockets retain their individual timeout; do not wait on
+        # them in the event loop, and cancel requests which have not started.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------- nmap wrapper(可选)----------------
@@ -143,18 +148,8 @@ async def scan_nmap(
     cmd = ["nmap", "-Pn", "-p", ports, "-oG", "-", "--", host]
     log.info(f"nmap: running {' '.join(cmd)}")
 
-    def _run():
-        return subprocess.run(
-            cmd, capture_output=True, timeout=timeout, text=True
-        )
-
-    loop = asyncio.get_running_loop()
-    try:
-        result = await loop.run_in_executor(None, _run)
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"nmap timeout after {timeout}s")
-    except FileNotFoundError:
-        raise FileNotFoundError("nmap not installed")
+    from ..core.process import run_process
+    result = await run_process(cmd, timeout=timeout)
 
     if result.returncode != 0:
         raise RuntimeError(f"nmap returned {result.returncode}: {result.stderr[:200]}")

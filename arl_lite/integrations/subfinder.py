@@ -94,6 +94,11 @@ async def run_subfinder(
         proc.kill()
         await proc.wait()
         raise TimeoutError(f"subfinder timeout after {timeout}s")
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.communicate()
+        raise
 
     partial_error = None
     if proc.returncode != 0:

@@ -35,6 +35,8 @@ class TaskRunner:
         self.current_task_id: int = 0
         self._modules: list[BaseModule] = []
         self._stop_requested = threading.Event()
+        self._module_tasks: list[asyncio.Task] = []
+        self._event_loop = None
 
     def mark_stopped(self) -> None:
         """SIGTERM 触发:只置事件,不做 DB 写
@@ -48,8 +50,13 @@ class TaskRunner:
 
     def request_stop_all(self) -> None:
         """SIGTERM 触发:通知所有 module 停止"""
+        self._stop_requested.set()
         for m in self._modules:
             m.request_stop()
+        loop = self._event_loop
+        if loop and loop.is_running():
+            for task in self._module_tasks:
+                loop.call_soon_threadsafe(task.cancel)
         log.debug(f"stop requested for {len(self._modules)} modules")
 
     def cleanup(self) -> None:
@@ -58,6 +65,26 @@ class TaskRunner:
         log.debug("cleanup done")
 
     async def run(
+        self, target: str, modules: list[str] | None = None,
+        preset: str | None = None, config: dict | None = None,
+    ) -> ModuleResult:
+        """Finalize tasks even when setup, persistence or cancellation aborts."""
+        try:
+            return await self._run(target, modules, preset, config)
+        except BaseException as exc:
+            if self.current_task_id:
+                status = "STOPPED" if self._stop_requested.is_set() or isinstance(exc, asyncio.CancelledError) else "FAILED"
+                self.storage.update_task_status(self.current_task_id, status,
+                    finished_at=datetime.utcnow().isoformat(), error_message=type(exc).__name__)
+            raise
+        finally:
+            self.current_task_id = 0
+            self._modules = []
+            self._module_tasks = []
+            self._event_loop = None
+            self._stop_requested.clear()
+
+    async def _run(
         self,
         target: str,
         modules: list[str] | None = None,
@@ -136,25 +163,31 @@ class TaskRunner:
                     log.info(f"[{mod.name}] running on {target}...")
                     await mod.setup()
                     result = await mod.run(target)
-                    await mod.teardown()
                     log.info(
                         f"[{mod.name}] done: found={result.found} "
                         f"duration={result.duration_seconds:.1f}s errors={len(result.errors)}"
                     )
                     return result
+                except asyncio.CancelledError:
+                    self.storage.record_source_status(task_id, mod.name, False,
+                        error_type="cancelled", error_message="execution stopped")
+                    raise
                 except Exception as e:
                     log.exception(f"[{mod.name}] crashed: {e}")
                     return ModuleResult(
                         success=False, target=target, found=0,
                         duration_seconds=0, errors=[f"{mod.name} crashed: {e}"],
                     )
+                finally:
+                    await mod.teardown()
 
             # asyncio.gather 让所有 module 并发跑
             # return_exceptions=True 防止一个 module 异常杀掉其他
-            gathered = await asyncio.gather(
-                *(_run_one(mod) for mod in selected),
-                return_exceptions=True,
-            )
+            self._event_loop = asyncio.get_running_loop()
+            self._module_tasks = [asyncio.create_task(_run_one(mod)) for mod in selected]
+            if self._stop_requested.is_set():
+                self.request_stop_all()
+            gathered = await asyncio.gather(*self._module_tasks, return_exceptions=True)
             for r in gathered:
                 if isinstance(r, BaseException):
                     all_errors.append(f"gather: {type(r).__name__}: {r}")

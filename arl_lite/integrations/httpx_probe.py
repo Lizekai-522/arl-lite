@@ -221,15 +221,17 @@ async def probe(
         return
 
     loop = asyncio.get_running_loop()
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    try:
         futures = {pool.submit(_do_request, url, timeout): (url, h, p)
                    for url, h, p in targets}
-        for fut in as_completed(futures):
-            url, h, p = futures[fut]
+        for fut in asyncio.as_completed([asyncio.wrap_future(f) for f in futures]):
             # wrap_future 让事件循环在等待时能调度其他协程;
             # 旧的 await loop.run_in_executor(None, fut.result) 会阻塞整个
             # loop(实测冻结 2s+),gather 里其他模块全部停摆
-            r = await asyncio.wrap_future(fut)
+            r = await fut
+            url = r['url']
+            _, h, p = next(t for t in targets if t[0] == url)
             if r.get("error") and not r.get("status"):
                 # 网络错(无响应)
                 continue
@@ -251,3 +253,5 @@ async def probe(
                 "content_length": r.get("content_length", 0),
                 "content_type": r.get("content_type", ""),
             }
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)

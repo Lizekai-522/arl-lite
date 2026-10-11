@@ -118,7 +118,7 @@ def _parse_whois_response(text) -> dict:
     return result
 
 
-def whois_query(domain: str, server: Optional[str] = None, timeout: int = 10) -> dict:
+def whois_query(domain: str, server: Optional[str] = None, timeout: int = 10, should_stop=lambda: False) -> dict:
     """查询域名的 WHOIS 信息
 
     Args:
@@ -150,6 +150,8 @@ def whois_query(domain: str, server: Optional[str] = None, timeout: int = 10) ->
         sock.sendall(f"{domain}\r\n".encode("utf-8"))
         chunks = []
         while True:
+            if should_stop():
+                raise InterruptedError("WHOIS stopped")
             try:
                 chunk = sock.recv(4096)
                 if not chunk:

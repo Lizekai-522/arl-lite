@@ -120,14 +120,14 @@ class FingerprintModule(BaseModule):
                 except (urllib.error.URLError, OSError):
                     raise e  # 两个 scheme 都失败,抛原始错误
 
-            body = resp.read(200 * 1024).decode("utf-8", errors="ignore")
+            body = (await asyncio.to_thread(resp.read, 200 * 1024)).decode("utf-8", errors="ignore")
             status = resp.status
             headers = {k: v for k, v in resp.headers.items()}
             resp.close()
         except urllib.error.HTTPError as e:
             # 4xx/5xx 也保留响应(404 也有 server header)
             try:
-                body = e.read(200 * 1024).decode("utf-8", errors="ignore")
+                body = (await asyncio.to_thread(e.read, 200 * 1024)).decode("utf-8", errors="ignore")
             except Exception:
                 body = ""
             status = e.code
