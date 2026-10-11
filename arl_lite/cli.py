@@ -895,7 +895,7 @@ def build_parser() -> argparse.ArgumentParser:
     # query
     pq = sub.add_parser("query", help="查询资产")
     pq.add_argument("table", choices=["domains", "hosts", "ports", "sites", "findings",
-                                        "tasks", "source_status", "correlations", "asset_changes"])
+                                        "tasks", "source_status", "correlations", "asset_changes", "asset_observations"])
     pq.add_argument("-f", "--filter", help="SQL WHERE 子句(不含 WHERE 关键字)")
     pq.add_argument("-l", "--limit", type=int, default=50)
     pq.add_argument("-w", "--workspace", help="工作空间名", default="default")

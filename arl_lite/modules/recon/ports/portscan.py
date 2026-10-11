@@ -100,7 +100,7 @@ class PortscanModule(BaseModule):
 
         for host in hosts:
             results, err, etype = await scan(
-                host, ports=ports, prefer=prefer, timeout_per_port=timeout_per_port,
+                host, ports=ports, prefer=prefer, timeout_per_port=timeout_per_port, include_closed=True,
             )
             if err:
                 all_errors.append(f"{host}: {err}")
@@ -108,6 +108,10 @@ class PortscanModule(BaseModule):
 
         # 入库
         for r in all_results:
+            if r["state"] == "unknown":
+                self.storage.record_port_unknown(self.task_id, r["host"], r["port"], self.name, r.get("reason", "filtered/unknown"))
+                all_errors.append(f'{r["host"]}:{r["port"]}: {r.get("reason", "filtered/unknown")}')
+                continue
             self.storage.add_port(
                 task_id=self.task_id,
                 host=r["host"],
@@ -124,7 +128,7 @@ class PortscanModule(BaseModule):
         )
 
         return ModuleResult(
-            success=sr.ok, target=target, found=len(all_results),
+            success=sr.ok, target=target, found=sum(r["state"] == "open" for r in all_results),
             duration_seconds=time.time() - start,
             sources=[sr], errors=all_errors,
             metadata={

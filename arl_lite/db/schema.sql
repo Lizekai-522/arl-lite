@@ -251,6 +251,24 @@ CREATE TABLE IF NOT EXISTS source_status (
 CREATE INDEX IF NOT EXISTS idx_source_status_task ON source_status(task_id);
 CREATE INDEX IF NOT EXISTS idx_source_status_ws_ok ON source_status(workspace_id, ok);
 
+-- One measurement per asset/source/run; current asset rows are a projection.
+-- UNKNOWN is an incomplete measurement, never evidence of disappearance.
+CREATE TABLE IF NOT EXISTS asset_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    asset_type TEXT NOT NULL,
+    asset_hash TEXT NOT NULL,
+    source TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('PRESENT', 'ABSENT', 'UNKNOWN')),
+    payload TEXT,
+    observed_at TEXT NOT NULL,
+    UNIQUE(workspace_id, task_id, asset_type, asset_hash, source),
+    FOREIGN KEY(workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_observations_run ON asset_observations(workspace_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_observations_asset ON asset_observations(workspace_id, asset_type, asset_hash, source);
+
 -- ----------------------------------------------------------------------------
 -- 9. asset_changes —— 变更事件表(真 diff,替代"定期重扫冒充监控")
 -- ----------------------------------------------------------------------------

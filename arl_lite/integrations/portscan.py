@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import re
 import socket
@@ -74,7 +75,7 @@ COMMON_PORTS = {
 }
 
 
-def _probe_tcp(host: str, port: int, timeout: float) -> dict | None:
+def _probe_tcp(host: str, port: int, timeout: float, include_closed: bool = False) -> dict | None:
     """同步 TCP connect 探测(单端口)"""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -87,8 +88,15 @@ def _probe_tcp(host: str, port: int, timeout: float) -> dict | None:
                     "state": "open",
                     "service": COMMON_PORTS.get(port, "unknown"),
                 }
+        if include_closed:
+            return {"host": host, "port": port, "state": "closed" if err in (errno.ECONNREFUSED, 10061) else "unknown",
+                    "service": COMMON_PORTS.get(port, "unknown"), "reason": f"connect-error:{err}"}
         return None
-    except (socket.timeout, socket.gaierror, ConnectionRefusedError, OSError):
+    except (socket.timeout, socket.gaierror, ConnectionRefusedError, OSError) as error:
+        if include_closed:
+            return {"host": host, "port": port,
+                    "state": "closed" if isinstance(error, ConnectionRefusedError) else "unknown",
+                    "service": COMMON_PORTS.get(port, "unknown"), "reason": type(error).__name__}
         return None
 
 
@@ -97,6 +105,7 @@ async def scan_tcp(
     ports: list[int],
     timeout: float = DEFAULT_TIMEOUT,
     concurrency: int = DEFAULT_CONCURRENCY,
+    include_closed: bool = False,
 ) -> AsyncIterator[dict]:
     """纯 Python TCP connect 扫描
 
@@ -107,7 +116,7 @@ async def scan_tcp(
     # 用 ThreadPoolExecutor 跑阻塞 socket(因为 socket.connect_ex 是阻塞)
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = {
-            pool.submit(_probe_tcp, host, port, timeout): port
+            pool.submit(_probe_tcp, host, port, timeout, include_closed): port
             for port in ports
         }
         for fut in as_completed(futures):
@@ -135,6 +144,7 @@ async def scan_nmap(
     host: str,
     ports: str,
     timeout: int = 300,
+    include_closed: bool = False,
 ) -> AsyncIterator[dict]:
     """subprocess 调 nmap,解析输出
 
@@ -178,8 +188,10 @@ async def scan_nmap(
                 # 畸形 token(注释/截断行)跳过,别让整个扫描报 EXC
                 continue
             state = parts[1]
-            if state != "open":
+            if state != "open" and not include_closed:
                 continue
+            if state not in ("open", "closed"):
+                state = "unknown"
             service = parts[4] if len(parts) > 4 and parts[4] else COMMON_PORTS.get(port, "unknown")
             yield {
                 "host": host,
@@ -194,6 +206,7 @@ async def scan(
     ports: str = "21,22,23,25,80,110,135,139,143,161,389,443,445,465,587,636,873,993,995,1080,1433,1521,2049,2181,3306,3389,3690,4444,5000,5432,5601,5900,5984,6379,7001,8000,8008,8080,8081,8443,8888,9000,9090,9200,9300,11211,27017,50070,61613",
     prefer: str = "auto",  # "auto" / "nmap" / "python"
     timeout_per_port: float = DEFAULT_TIMEOUT,
+    include_closed: bool = False,
 ) -> tuple[list[dict], str | None, str | None]:
     """端口扫描入口
 
@@ -220,7 +233,7 @@ async def scan(
     if use_nmap:
         try:
             results = []
-            async for r in scan_nmap(host, ports, timeout=300):
+            async for r in scan_nmap(host, ports, timeout=300, include_closed=include_closed):
                 results.append(r)
             return results, None, None
         except FileNotFoundError as e:
@@ -232,7 +245,7 @@ async def scan(
     # 纯 Python TCP connect 扫描
     try:
         results = []
-        async for r in scan_tcp(host, port_list, timeout=timeout_per_port):
+        async for r in scan_tcp(host, port_list, timeout=timeout_per_port, include_closed=include_closed):
             results.append(r)
         return results, None, None
     except Exception as e:

@@ -496,7 +496,7 @@ class Storage:
     # =========================
 
     # 各表允许被重扫刷新的业务字段。
-    # TEXT 类:新值为空则保留旧值(COALESCE(NULLIF(...)));
+    # TEXT: None is unknown (preserve); "" is an observed empty value (clear).
     # PLAIN 类:直接取新值(端口状态/服务这类"变了就是要变")。
     _MUTABLE_TEXT: dict[str, tuple[str, ...]] = {
         "domains": ("resolved_ip",),
@@ -550,23 +550,78 @@ class Storage:
             if k in plain_cols:
                 sets.append(f"{k} = excluded.{k}")
             elif k in text_cols:
-                sets.append(f"{k} = COALESCE(NULLIF(excluded.{k}, ''), {k})")
+                sets.append(f"{k} = COALESCE(excluded.{k}, {k})")
         update_clause = ", ".join(sets)
 
         with self._conn() as conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
-                f"SELECT 1 FROM {table} WHERE hash = ?", (asset_hash,)
+                f"SELECT * FROM {table} WHERE workspace_id = ? AND hash = ?", (workspace_id, asset_hash)
             ).fetchone()
             conn.execute(
                 f"""INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})
                     ON CONFLICT(workspace_id, hash) DO UPDATE SET {update_clause}""",
                 values
             )
+            after = dict(conn.execute(f"SELECT * FROM {table} WHERE workspace_id = ? AND hash = ?",
+                                     (workspace_id, asset_hash)).fetchone())
+            asset_type = {"domains": "domain", "hosts": "host", "ports": "port",
+                          "sites": "site", "findings": "finding"}[table]
+            observation_status = "ABSENT" if table == "ports" and fields.get("state") == "closed" else "PRESENT"
+            self._observe(conn, task_id, asset_type, asset_hash, module, observation_status,
+                          {**after, **fields, "task_id": task_id, "module": module}, now)
+            before = dict(existing) if existing else None
+            diff = {k: {"before": before.get(k), "after": after.get(k)}
+                    for k in (*text_cols, *plain_cols)
+                    if before is not None and before.get(k) != after.get(k)}
+            if (before is None and observation_status == "PRESENT") or diff:
+                conn.execute("""INSERT INTO asset_changes
+                    (workspace_id, asset_hash, asset_type, change_type, before_value,
+                     after_value, diff, detected_at, detected_by_task_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (workspace_id, asset_hash, asset_type,
+                     "DISAPPEARED" if before and table == "ports" and before.get("state") == "open" and after.get("state") == "closed"
+                     else "REAPPEARED" if before and table == "ports" and before.get("state") == "closed" and after.get("state") == "open"
+                     else "NEW_ASSET" if before is None else "FIELDS_CHANGED",
+                     json.dumps(before, default=str) if before is not None else None,
+                     json.dumps(after, default=str), json.dumps(diff, default=str), now, task_id))
             if existing:
                 log.debug(f"upsert: {table} hash={asset_hash} first_seen kept, refreshed")
                 return False
             log.debug(f"upsert: {table} hash={asset_hash} (new insert)")
             return True
+
+    def _observe(self, conn, task_id, asset_type, asset_hash, source, status, payload, now):
+        conn.execute("""INSERT INTO asset_observations
+            (workspace_id, task_id, asset_type, asset_hash, source, status, payload, observed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, task_id, asset_type, asset_hash, source)
+            DO UPDATE SET status=excluded.status, payload=excluded.payload, observed_at=excluded.observed_at""",
+            (self.workspace_id, task_id, asset_type, asset_hash, source, status,
+             json.dumps(payload, default=str), now))
+
+    def get_run_observations(self, task_id: int) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM asset_observations WHERE workspace_id=? AND task_id=? ORDER BY id",
+                (self.workspace_id, task_id))]
+
+    def record_port_unknown(self, task_id: int, host: str, port: int, source: str, reason: str) -> None:
+        """A failed/filtered probe is an observation, never a closed-port fact."""
+        now = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            if not conn.execute("SELECT 1 FROM tasks WHERE id=? AND workspace_id=?",
+                                (task_id, self.workspace_id)).fetchone():
+                raise ValueError("observation task must belong to workspace")
+            self._observe(conn, task_id, "port", compute_hash(str(self.workspace_id), f"{host}:{port}"),
+                          source, "UNKNOWN", {"host": host, "port": port, "reason": reason}, now)
+
+    def get_run_changes(self, task_id: int) -> list[dict]:
+        with self._conn() as conn:
+            return [dict(row) for row in conn.execute(
+                "SELECT * FROM asset_changes WHERE workspace_id=? AND detected_by_task_id=? ORDER BY id",
+                (self.workspace_id, task_id))]
 
     # ---------- 批量入库(Phase 7 性能优化)----------
 
@@ -980,6 +1035,22 @@ class Storage:
                 (task_id, workspace_id, source_name, source_type, int(ok), int(enabled),
                  found_count, duration_seconds, error_type, error_message, now, now)
             )
+            if not ok:
+                # Only the same target/source's previous observations belong
+                # to this failed run. Partial PRESENT rows remain present.
+                observation_source = "builtin" if source_name == "nuclei-fallback" else source_name
+                rows = conn.execute("""SELECT DISTINCT o.asset_type, o.asset_hash
+                    FROM asset_observations o JOIN tasks previous ON previous.id=o.task_id
+                    JOIN tasks current ON current.id=? AND current.workspace_id=o.workspace_id
+                    WHERE o.workspace_id=? AND previous.target=current.target AND o.source=?
+                    AND NOT EXISTS (SELECT 1 FROM asset_observations current_o
+                        WHERE current_o.workspace_id=o.workspace_id AND current_o.task_id=?
+                        AND current_o.asset_hash=o.asset_hash AND current_o.asset_type=o.asset_type
+                        AND current_o.source=o.source)""",
+                    (task_id, workspace_id, observation_source, task_id)).fetchall()
+                for row in rows:
+                    self._observe(conn, task_id, row["asset_type"], row["asset_hash"],
+                                  observation_source, "UNKNOWN", {"error": error_message, "error_type": error_type}, now)
 
     # =========================
     # 查询
@@ -1001,7 +1072,7 @@ class Storage:
         """
         ALLOWED = {"domains", "hosts", "ports", "sites", "findings",
                    "tasks", "source_status", "correlations", "asset_changes",
-                   "workspaces", "monitors", "schedules"}
+                   "workspaces", "monitors", "schedules", "asset_observations"}
         if table not in ALLOWED:
             raise ValueError(f"table '{table}' not in whitelist: {sorted(ALLOWED)}")
 

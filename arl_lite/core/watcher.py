@@ -233,15 +233,11 @@ class Watcher:
     def _run_target(self, wt: WatchTarget) -> None:
         """跑一个 target(同步)— 包含变化检测 + monitor 变更接线"""
         from ..core.task_runner import TaskRunner  # 延迟 import 避免循环
-        from ..core.monitor import Monitor, record_change
+        from ..core.monitor import Monitor
         from ..notify import notify_task_done, notify_critical_finding
 
         start = time.time()
-        start_iso = datetime.utcnow().isoformat()
         log.info(f"watch: running target={wt.target} modules={wt.modules}")
-
-        # 记录本次开始前资产数(走 COUNT(*),别全表载入再 len)
-        before = self._count_assets()
 
         runner = TaskRunner(
             storage=self.storage,
@@ -263,10 +259,13 @@ class Watcher:
         finally:
             self._current_runner = None
 
-        after = self._count_assets()
-        # max(0):资产被删/并发清库时差值可为负,通知语义只关心"新增"
-        new_by_type = {t: max(0, after.get(t, 0) - before.get(t, 0))
-                       for t in ("hosts", "domains", "findings")}
+        task_id = result.metadata.get("task_id")
+        if not task_id:
+            log.warning("watch: runner returned no task_id; cannot attribute changes")
+            return
+        changes = self.storage.get_run_changes(task_id)
+        new_by_type = {t: sum(c["asset_type"] == t and c["change_type"] == "NEW_ASSET" for c in changes)
+                       for t in ("host", "domain", "port", "site", "finding")}
         new_total = sum(new_by_type.values())
 
         # 更新 target 状态
@@ -274,7 +273,7 @@ class Watcher:
         wt.next_run = datetime.fromtimestamp(
             time.time() + wt.interval_seconds
         ).isoformat()
-        wt.last_count = after.get("hosts", 0) + after.get("domains", 0)
+        wt.last_count = len(self.storage.get_run_observations(task_id))
         wt.run_count += 1
         wt.new_count += new_total
 
@@ -282,34 +281,26 @@ class Watcher:
         log.info(
             f"watch: target={wt.target} done in {duration:.1f}s, "
             f"new={new_total} "
-            f"(hosts={new_by_type['hosts']} domains={new_by_type['domains']} findings={new_by_type['findings']})"
+            f"changes={len(changes)}"
         )
 
-        # 变更检测接线:本次新增的资产逐条写 asset_changes(之前 detect_changes
-        # 没有任何调用者,`monitor changes` 永远是空的)
+        # Changes are recorded atomically by storage and attributed by run,
+        # including fields changed on an existing asset.
         critical_findings: list[dict] = []
-        for asset_type, table in (("domain", "domains"), ("host", "hosts"),
-                                  ("port", "ports"), ("site", "sites"),
-                                  ("finding", "findings")):
-            try:
-                new_rows = Monitor(self.storage).detect_changes(asset_type, start_iso)
-            except Exception as e:
-                log.warning(f"watch: detect_changes({asset_type}) failed: {e}")
+        import json
+        for change in changes:
+            if change["asset_type"] != "finding":
                 continue
-            for row in new_rows[:200]:  # 防止变更风暴刷爆 asset_changes
-                record_change(
-                    self.storage, asset_type, "NEW_ASSET",
-                    asset_hash=row.get("hash") or "",
-                    after=row, task_id=row.get("task_id"),
-                )
-            if table == "findings":
-                critical_findings = [r for r in new_rows if r.get("severity") == "critical"]
+            after = json.loads(change["after_value"] or "{}")
+            before = json.loads(change["before_value"] or "{}")
+            if after.get("severity") == "critical" and before.get("severity") != "critical":
+                critical_findings.append(after)
 
         # 同步 monitors 表状态(如果有对该 target 的监控)
         try:
             for m in Monitor(self.storage).list():
                 if m.get("target") == wt.target:
-                    Monitor(self.storage).record_run(m["id"], new_total)
+                    Monitor(self.storage).record_run(m["id"], len(changes))
         except Exception as e:
             log.debug(f"watch: monitor record_run failed: {e}")
 
@@ -317,7 +308,7 @@ class Watcher:
         if self.webhook:
             notify_task_done(
                 self.webhook,
-                task_id=0,  # watch 不绑定 task
+                task_id=task_id,
                 target=wt.target,
                 found=new_total,
                 duration_seconds=duration,
